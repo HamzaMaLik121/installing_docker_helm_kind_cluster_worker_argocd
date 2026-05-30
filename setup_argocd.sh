@@ -5,6 +5,7 @@ set -e
 # ============================================================
 #        FULL ARGOCD SETUP SCRIPT - AWS EC2 (Ubuntu)
 #        Installs: Docker, Kind, Kubectl, Helm, ArgoCD
+#        Enhanced: Docker socket perms, private IP support
 # ============================================================
 
 CLUSTER_NAME="argocd-cluster"
@@ -24,6 +25,27 @@ PRIVATE_IP=$(hostname -I | awk '{print $1}')
 echo "🌐 Detected Private IP: $PRIVATE_IP"
 
 # ============================================================
+# STEP 0: Fix Docker Socket Permissions (upfront)
+# ============================================================
+echo ""
+echo "🔧 [0/7] Fixing Docker socket permissions..."
+
+# Add user to docker group
+sudo usermod -aG docker $USER 2>/dev/null || true
+
+# Fix socket permissions immediately (no logout needed)
+sudo chmod 666 /var/run/docker.sock 2>/dev/null || true
+
+# Verify docker works now
+if docker ps &>/dev/null; then
+    echo "✅ Docker socket accessible without sudo."
+    DOCKER="docker"
+else
+    echo "⚠️  Falling back to sudo docker."
+    DOCKER="sudo docker"
+fi
+
+# ============================================================
 # STEP 1: Install Docker
 # ============================================================
 echo ""
@@ -40,7 +62,6 @@ else
         lsb-release \
         apt-transport-https
 
-    # Add Docker's official GPG key & repo
     sudo install -m 0755 -d /etc/apt/keyrings
     curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
         sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
@@ -54,52 +75,46 @@ else
 
     sudo apt-get update -y
     sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+    # Fix permissions right after install
+    sudo usermod -aG docker $USER
+    sudo chmod 666 /var/run/docker.sock
+
     echo "✅ Docker installed: $(docker --version)"
 fi
 
-# ============================================================
-# STEP 2: Fix Docker Permissions
-# ============================================================
-echo ""
-echo "🔐 [2/7] Fixing Docker permissions..."
-
 sudo systemctl enable docker
 sudo systemctl start docker
-sudo usermod -aG docker $USER
 
-# Apply group without needing logout
-if ! groups $USER | grep -q docker; then
-    echo "⚠️  Adding $USER to docker group (takes effect in this session via newgrp)"
-fi
-
-# Run all subsequent docker commands with sudo fallback
-DOCKER="sudo docker"
-if docker ps &>/dev/null 2>&1; then
+# Re-check after install
+if docker ps &>/dev/null; then
     DOCKER="docker"
+else
+    DOCKER="sudo docker"
 fi
 
-echo "✅ Docker permissions OK."
+echo "✅ Docker is running."
 
 # ============================================================
-# STEP 3: Install kubectl
+# STEP 2: Install kubectl
 # ============================================================
 echo ""
-echo "☸️  [3/7] Installing kubectl ($KUBECTL_VERSION)..."
+echo "☸️  [2/7] Installing kubectl ($KUBECTL_VERSION)..."
 
 if command -v kubectl &> /dev/null; then
-    echo "✅ kubectl already installed: $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
+    echo "✅ kubectl already installed: $(kubectl version --client 2>/dev/null | head -1)"
 else
     curl -LO "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl"
     chmod +x kubectl
     sudo mv kubectl /usr/local/bin/kubectl
-    echo "✅ kubectl installed: $(kubectl version --client --short 2>/dev/null || kubectl version --client)"
+    echo "✅ kubectl installed: $(kubectl version --client 2>/dev/null | head -1)"
 fi
 
 # ============================================================
-# STEP 4: Install Kind
+# STEP 3: Install Kind
 # ============================================================
 echo ""
-echo "📦 [4/7] Installing Kind ($KIND_VERSION)..."
+echo "📦 [3/7] Installing Kind ($KIND_VERSION)..."
 
 if command -v kind &> /dev/null; then
     echo "✅ Kind already installed: $(kind version)"
@@ -111,10 +126,10 @@ else
 fi
 
 # ============================================================
-# STEP 5: Install Helm
+# STEP 4: Install Helm
 # ============================================================
 echo ""
-echo "⛵ [5/7] Installing Helm..."
+echo "⛵ [4/7] Installing Helm..."
 
 if command -v helm &> /dev/null; then
     echo "✅ Helm already installed: $(helm version --short)"
@@ -124,17 +139,33 @@ else
 fi
 
 # ============================================================
-# STEP 6: Create Kind Cluster
+# STEP 5: Install ArgoCD CLI
+# ============================================================
+echo ""
+echo "🔧 [5/7] Installing ArgoCD CLI..."
+
+if command -v argocd &> /dev/null; then
+    echo "✅ ArgoCD CLI already installed: $(argocd version --client 2>/dev/null | head -1)"
+else
+    curl -sSL -o argocd-linux-amd64 \
+        https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
+    sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
+    rm -f argocd-linux-amd64
+    echo "✅ ArgoCD CLI installed."
+fi
+
+# ============================================================
+# STEP 6: Create Kind Cluster with Private IP
 # ============================================================
 echo ""
 echo "☸️  [6/7] Creating Kind Cluster: $CLUSTER_NAME ..."
+echo "📌 Using Private IP: $PRIVATE_IP for API server"
 
-# Write kind config using 0.0.0.0 (works on all EC2 instances)
 cat > $KIND_CONFIG <<EOF
 kind: Cluster
 apiVersion: kind.x-k8s.io/v1alpha4
 networking:
-  apiServerAddress: "0.0.0.0"
+  apiServerAddress: "$PRIVATE_IP"
   apiServerPort: 6443
 nodes:
   - role: control-plane
@@ -145,13 +176,21 @@ nodes:
     image: kindest/node:v1.33.1
 EOF
 
+echo "📄 Kind config written:"
+cat $KIND_CONFIG
+
+# Delete existing cluster if present
 if kind get clusters 2>/dev/null | grep -q "^${CLUSTER_NAME}$"; then
     echo "⚠️  Cluster '$CLUSTER_NAME' already exists. Deleting and recreating..."
     kind delete cluster --name $CLUSTER_NAME
 fi
 
-# Use sg docker to ensure docker group permissions are active
-sg docker -c "kind create cluster --name $CLUSTER_NAME --config $KIND_CONFIG"
+# Create cluster — use sg docker if needed
+if $DOCKER ps &>/dev/null; then
+    kind create cluster --name $CLUSTER_NAME --config $KIND_CONFIG
+else
+    sg docker -c "kind create cluster --name $CLUSTER_NAME --config $KIND_CONFIG"
+fi
 
 echo "✅ Kind cluster '$CLUSTER_NAME' is ready."
 kubectl cluster-info --context kind-$CLUSTER_NAME
@@ -169,7 +208,6 @@ echo "  2) Manifests  — simple, good for demos"
 echo "-----------------------------------------"
 read -p "Enter choice [1 or 2]: " choice
 
-# Create namespace
 kubectl create namespace $NAMESPACE 2>/dev/null || echo "⚠️  Namespace '$NAMESPACE' already exists."
 
 install_helm() {
@@ -198,22 +236,6 @@ else
 fi
 
 # ============================================================
-# Install ArgoCD CLI
-# ============================================================
-echo ""
-echo "🔧 Installing ArgoCD CLI..."
-
-if command -v argocd &> /dev/null; then
-    echo "✅ ArgoCD CLI already installed: $(argocd version --client --short 2>/dev/null || argocd version --client)"
-else
-    curl -sSL -o argocd-linux-amd64 \
-        https://github.com/argoproj/argo-cd/releases/latest/download/argocd-linux-amd64
-    sudo install -m 555 argocd-linux-amd64 /usr/local/bin/argocd
-    rm -f argocd-linux-amd64
-    echo "✅ ArgoCD CLI installed."
-fi
-
-# ============================================================
 # Wait for ArgoCD to be Ready
 # ============================================================
 echo ""
@@ -231,7 +253,7 @@ kubectl get svc -n $NAMESPACE
 # ============================================================
 echo ""
 echo "🔑 Fetching ArgoCD initial admin password..."
-sleep 5  # give secret a moment to populate
+sleep 5
 
 PASSWORD=$(kubectl get secret argocd-initial-admin-secret \
     -n $NAMESPACE \
@@ -245,27 +267,58 @@ else
 fi
 
 # ============================================================
-# Done — Access Instructions
+# Start Port-Forward with Private IP binding
 # ============================================================
-PUBLIC_IP=$(curl -s http://checkip.amazonaws.com || echo "<your-public-ip>")
+echo ""
+echo "🔁 Starting port-forward on $PRIVATE_IP:8080 ..."
+pkill -f "port-forward.*argocd-server" 2>/dev/null || true
+sleep 1
+kubectl port-forward svc/argocd-server -n $NAMESPACE 8080:443 --address=0.0.0.0 &
+sleep 3
+
+# ============================================================
+# Auto Login via CLI
+# ============================================================
+echo ""
+echo "🔐 Logging in to ArgoCD CLI..."
+if [ -n "$PASSWORD" ]; then
+    argocd login $PRIVATE_IP:8080 \
+        --username admin \
+        --password "$PASSWORD" \
+        --insecure && echo "✅ ArgoCD CLI logged in." || \
+    argocd login localhost:8080 \
+        --username admin \
+        --password "$PASSWORD" \
+        --insecure && echo "✅ ArgoCD CLI logged in via localhost."
+else
+    echo "⚠️  Skipping auto-login — password not ready."
+fi
+
+# ============================================================
+# Done
+# ============================================================
+PUBLIC_IP=$(curl -s http://checkip.amazonaws.com 2>/dev/null || echo "<your-public-ip>")
 
 echo ""
 echo "========================================="
 echo "   ✅ ArgoCD Setup Complete!"
 echo "========================================="
 echo ""
-echo "📌 Cluster:    $CLUSTER_NAME"
-echo "📌 Namespace:  $NAMESPACE"
-echo "📌 Public IP:  $PUBLIC_IP"
-echo "📌 Private IP: $PRIVATE_IP"
+echo "📌 Cluster:     $CLUSTER_NAME"
+echo "📌 Namespace:   $NAMESPACE"
+echo "📌 Private IP:  $PRIVATE_IP"
+echo "📌 Public IP:   $PUBLIC_IP"
 echo ""
-echo "🌐 Access ArgoCD UI:"
-echo "   kubectl port-forward svc/argocd-server -n $NAMESPACE 8080:443 --address=0.0.0.0 &"
-echo "   Then open: https://$PUBLIC_IP:8080"
+echo "🌐 ArgoCD UI:   http://$PUBLIC_IP:8080"
+echo "               http://$PRIVATE_IP:8080  (within VPC)"
 echo ""
-echo "🔐 CLI Login:"
-echo "   argocd login $PUBLIC_IP:8080 --username admin --password '$PASSWORD' --insecure"
+echo "🔐 CLI Login (if needed):"
+echo "   argocd login $PRIVATE_IP:8080 --username admin --password '$PASSWORD' --insecure"
+echo "   argocd login localhost:8080   --username admin --password '$PASSWORD' --insecure"
 echo ""
 echo "👤 Username: admin"
 echo "🔑 Password: $PASSWORD"
+echo ""
+echo "📌 kubeconfig server is set to: $PRIVATE_IP:6443"
+echo "   kubectl config view | grep server"
 echo "========================================="
